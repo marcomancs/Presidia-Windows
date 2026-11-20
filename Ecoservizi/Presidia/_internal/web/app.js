@@ -1968,8 +1968,8 @@ const App = (() => {
       const hasPrev = idx > 0;
       const hasNext = idx < active.length - 1;
       const nextLabel = hasNext ? 'Prossimo Capitolo →' : 'Fine — Torna alla Lista ✓';
-      // Cap6 è ora internalizzato (nessun Excel) → niente tasto "Apri fogli Excel".
-      const hasFogli = ['7', '10', '11'].includes(String(chapterId));
+      // Cap6 e Cap10 sono internalizzati (nessun Excel) → niente tasto "Apri fogli Excel".
+      const hasFogli = ['7', '11'].includes(String(chapterId));
       const btnFogli = hasFogli ? `
         <button class="btn btn-ghost" id="btn-fogli-xls" onclick="App.apriFogliCalcolo('${chapterId}')"
           title="Apre in Excel i fogli di calcolo del capitolo (schede/gruppi selezionati)">
@@ -2007,7 +2007,8 @@ const App = (() => {
     if (savedFormData) {
       for (const fd of state.manualFields) {
         if (fd.type && fd.type.endsWith('_editor')
-            && savedFormData[fd.id] && typeof savedFormData[fd.id] === 'object') {
+            && savedFormData[fd.id] && typeof savedFormData[fd.id] === 'object'
+            && !(fd.id === 'cap10_editor' && savedFormData[fd.id].versione !== 2)) {
           state.tablePrefill[fd.id] = savedFormData[fd.id];
         }
       }
@@ -6821,58 +6822,51 @@ const App = (() => {
     ['piano_pare',             'Redazione di un piano PARE (Programma Aziendale per la Riduzione dell\'Esposizione)'],
   ];
 
-  function _c10DefaultGruppo(id, nome, attrDisponibili) {
+  function _c10DefaultGruppo(id, nome) {
     return {
       id, nome: nome || `Gruppo ${id}`,
       sostanze_ototossiche: false, vibrazioni: false,
-      descrizione_attivita: '', rif_ambiente: String(id), rif_fase: String(id),
-      ore_lavoro_gg: 8,
-      attrezzature_selezionate: [],
-      postazioni: [],
+      descrizione_attivita: '', ore_lavoro_gg: 8, misure: [],
     };
   }
 
-  function _c10DefaultPostazione(num) {
-    return {
-      numero: num,
-      condizione_misura: '',
-      sorgenti_rumore: [{ nome: '', m1: '', m2: '', m3: '' }],
-      lavoratori_esposti: [{ gruppo: '', Tm_j: 480 }],
-      misure: [
-        { LAeq: '', LCeq: '', Lpicco: '' },
-        { LAeq: '', LCeq: '', Lpicco: '' },
-        { LAeq: '', LCeq: '', Lpicco: '' },
-      ],
-    };
+  function _c10DefaultMisura() {
+    return { attrezzatura: '', tempo_min: '', laeq: '', lceq: '', lpeak: '' };
   }
 
-  function _c10EnergyAvg(vals) {
-    const valid = vals.map(v => parseFloat(v)).filter(v => !isNaN(v) && v > 0);
-    if (!valid.length) return null;
-    const sum = valid.reduce((a, v) => a + Math.pow(10, v / 10), 0);
-    return 10 * Math.log10(sum / valid.length);
+  const C10_LIVELLI = ['Irrilevante', 'Basso', 'Medio', 'Alto'];
+  const _c10Timers = {};
+
+  function _c10f(v, d) {
+    if (v === null || v === undefined || (typeof v === 'number' && !isFinite(v))) return '—';
+    return Number(v).toFixed(d === undefined ? 1 : d).replace('.', ',');
   }
 
   function initCap10Editor(fieldId, data) {
-    const gruppi = Array.isArray(data && data.gruppi_omogenei) ? data.gruppi_omogenei : [];
-    const prescrizioni = (data && data.prescrizioni) || {};
-    const attDisp = (data && Array.isArray(data.attrezzature_disponibili)) ? data.attrezzature_disponibili : [];
+    // v2: il formato vecchio (postazioni) non è più leggibile → si ignora.
+    const ok = data && data.versione === 2;
+    const gruppi = ok && Array.isArray(data.gruppi_omogenei) ? data.gruppi_omogenei : [];
+    const prescrizioni = (ok && data.prescrizioni) || {};
     const defaultPrescrizioni = {};
     C10_PRESCRIZIONI.forEach(([k]) => { defaultPrescrizioni[k] = false; });
+    gruppi.forEach(g => { if (!Array.isArray(g.misure)) g.misure = []; });
     state.formValues[fieldId] = {
-      fonometro_tipo: (data && data.fonometro_tipo) || '',
-      attrezzature_disponibili: attDisp,
-      gruppi_omogenei: gruppi.length ? gruppi : [_c10DefaultGruppo(1, '', attDisp)],
+      versione: 2,
+      fonometro_tipo: (ok && data.fonometro_tipo) || '',
+      fonometri_extra: (ok && Array.isArray(data.fonometri_extra)) ? data.fonometri_extra : [],
+      gruppi_omogenei: gruppi,
       prescrizioni: Object.assign({}, defaultPrescrizioni, prescrizioni),
     };
+    setTimeout(() => gruppi.forEach((_, gi) => _c10Calc(fieldId, gi)), 50);
   }
 
-  function _c10Rebuild(fieldId, keepOpenGi = 0) {
+  function _c10Rebuild(fieldId, keepOpenGi = -1) {
     const outer = document.querySelector(`[data-field-id="${fieldId}"]`);
     if (outer) outer.innerHTML = buildCap10Editor(fieldId, state.formValues[fieldId]);
     setTimeout(() => {
       outer?.querySelectorAll('select:not(.csel-hidden)').forEach(wrapSelectCustom);
-      if (keepOpenGi > 0) toggleC10Gruppo(fieldId, keepOpenGi);
+      if (keepOpenGi >= 0) toggleC10Gruppo(fieldId, keepOpenGi);
+      (state.formValues[fieldId]?.gruppi_omogenei || []).forEach((_, gi) => _c10Calc(fieldId, gi));
     }, 0);
     saveChapterDraft();
   }
@@ -6880,21 +6874,18 @@ const App = (() => {
   function buildCap10Editor(fieldId, data) {
     const ed = state.formValues[fieldId] || {};
     const fonId = ed.fonometro_tipo || '';
-    const fonObj = C10_FONOMETRI.find(f => f.id === fonId);
-    const attDisp = ed.attrezzature_disponibili || [];
+    const extra = ed.fonometri_extra || [];
     const gruppi = ed.gruppi_omogenei || [];
     const prescrizioni = ed.prescrizioni || {};
 
     const optsFon = C10_FONOMETRI.map(f =>
       `<option value="${f.id}"${f.id === fonId ? ' selected' : ''}>${escHtml(f.label)} (Classe ${f.classe})</option>`
     ).join('');
+    const extraHtml = C10_FONOMETRI.filter(f => f.id !== fonId).map(f => `
+      <label class="c10-att-row"><input type="checkbox" ${extra.includes(f.id) ? 'checked' : ''}
+        onchange="App.onC10FonExtra('${fieldId}','${f.id}',this.checked)"><span>${escHtml(f.label)}</span></label>`).join('');
 
-    const classeInfo = fonObj
-      ? `<span class="c10-classe c10-classe-${fonObj.classe}">Strumentazione di Classe ${fonObj.classe} (${fonObj.classe === 'II' ? 'IEC 651/79 e 804/85' : 'IEC 651/79 e 804/85 — precisione'})</span>`
-      : '';
-
-    const gruppiHtml = gruppi.map((g, gi) => _c10GruppoHtml(fieldId, gi, g, attDisp)).join('');
-
+    const gruppiHtml = gruppi.map((g, gi) => _c10GruppoHtml(fieldId, gi, g)).join('');
     const prescHtml = C10_PRESCRIZIONI.map(([key, label]) => `
       <label class="c10-presc-row">
         <input type="checkbox" class="c10-presc-cb" ${prescrizioni[key] ? 'checked' : ''}
@@ -6905,17 +6896,16 @@ const App = (() => {
     return `<div class="c10-editor" id="c10-editor-${fieldId}">
       <div class="c10-help">
         <div class="c10-help-title">${ic('info', 15)} Come si compila questo capitolo</div>
-        <p class="c10-help-text">Qui valuti l'esposizione al rumore dei lavoratori. Segui i 3 passaggi qui sotto, in ordine:</p>
+        <p class="c10-help-text">I dati arrivano dalle misurazioni inserite in Presidia (sezione Rumore). Qui puoi controllarli e correggerli: i calcoli (LEX,8h, incertezza, verifica DPI, rischio) si aggiornano da soli per ogni gruppo omogeneo.</p>
         <ol class="c10-help-steps">
-          <li><b>Strumento</b> — scegli il fonometro usato per le misure.</li>
-          <li><b>Gruppi esposti</b> — per ogni gruppo di lavoratori indica le attrezzature rumorose e aggiungi le <b>postazioni di misura</b> con i valori del fonometro (LAeq, Lpicco) e i lavoratori esposti.</li>
-          <li><b>Prescrizioni</b> — spunta le misure di riduzione del rischio adottate.</li>
+          <li><b>Strumento</b> — fonometro usato per le misure.</li>
+          <li><b>Gruppi omogenei</b> — per ciascuno: attrezzature, tempi di esposizione e livelli misurati; sotto trovi i risultati finali.</li>
+          <li><b>Prescrizioni</b> — misure di riduzione del rischio.</li>
         </ol>
       </div>
 
       <div class="c10-section">
         <div class="c10-section-hdr"><span class="c10-step">1</span> Strumento di misura</div>
-        <div class="c10-section-desc">Seleziona il fonometro con cui sono state eseguite le misurazioni.</div>
         <div class="c10-row">
           <label class="c10-lbl">Fonometro utilizzato</label>
           <select class="c10-sel" onchange="App.onC10Fonometro('${fieldId}',this.value)">
@@ -6923,218 +6913,137 @@ const App = (() => {
             ${optsFon}
           </select>
         </div>
-        ${classeInfo}
+        ${fonId ? `<div class="c10-subsec-hdr c10-mt">Altri fonometri usati (facoltativo)</div>
+        <div class="c10-att-grid">${extraHtml}</div>` : ''}
       </div>
 
       <div class="c10-section">
         <div class="c10-section-hdr"><span class="c10-step">2</span> Gruppi omogenei esposti al rumore</div>
-        <div class="c10-section-desc">Un gruppo per ogni insieme di lavoratori con la stessa esposizione. Clicca su un gruppo per aprirlo e inserire attrezzature, postazioni di misura e lavoratori esposti.</div>
-        ${gruppiHtml || `<div class="c10-empty-hint">Nessun gruppo. Aggiungine uno per iniziare.</div>`}
+        <div class="c10-section-desc">Un blocco per ogni gruppo omogeneo: apri il gruppo per vedere o modificare dati e risultati.</div>
+        ${gruppiHtml || `<div class="c10-empty-hint">Nessun gruppo con misurazioni di rumore nel JSON. Aggiungine uno per iniziare.</div>`}
         <button class="c10-add-btn" onclick="App.onC10AddGruppo('${fieldId}')">${ic('plus', 13)} Aggiungi gruppo omogeneo</button>
       </div>
 
       <div class="c10-section">
         <div class="c10-section-hdr"><span class="c10-step">3</span> Prescrizioni e misure di riduzione</div>
-        <div class="c10-section-desc">Spunta le misure di prevenzione e protezione adottate per ridurre il rischio rumore.</div>
-        <div class="c10-prescrizioni">
-          ${prescHtml}
-        </div>
+        <div class="c10-prescrizioni">${prescHtml}</div>
       </div>
     </div>`;
   }
 
-  function _c10GruppoHtml(fieldId, gi, g, attDisp) {
-    // Elenca le attrezzature DEL gruppo (non quelle di tutti i gruppi): fix
-    // associazione attrezzature↔gruppo (feedback 2026-10-15). Fallback alla
-    // lista globale solo se il gruppo non porta la propria.
-    const attList = (Array.isArray(g.attrezzature) && g.attrezzature.length)
-      ? g.attrezzature : attDisp;
-    const attChecks = attList.map(a => {
-      const sel = g.attrezzature_selezionate && g.attrezzature_selezionate.includes(a);
-      return `<label class="c10-att-row">
-        <input type="checkbox" ${sel ? 'checked' : ''}
-          onchange="App.onC10AttSel('${fieldId}',${gi},'${escHtml(a).replace(/'/g,"\\'")}',this.checked)">
-        <span>${escHtml(a)}</span>
-      </label>`;
+  function _c10GruppoHtml(fieldId, gi, g) {
+    const righe = (g.misure || []).map((m, mi) => {
+      const inp = (key, ph, step) => `<input class="c10-meas" type="number" step="${step}" value="${m[key] === undefined || m[key] === null ? '' : m[key]}"
+        onchange="App.onC10Misura('${fieldId}',${gi},${mi},'${key}',this.value)" placeholder="${ph}">`;
+      return `<tr>
+        <td class="c10-td-center">${mi + 1}</td>
+        <td><input class="c10-inp" type="text" value="${escHtml(m.attrezzatura || '')}"
+          onchange="App.onC10Misura('${fieldId}',${gi},${mi},'attrezzatura',this.value)" placeholder="Attrezzatura / rumore di fondo"></td>
+        <td>${inp('tempo_min', 'min', 1)}</td>
+        <td>${inp('laeq', 'dBA', 0.1)}</td>
+        <td>${inp('lceq', 'dBC', 0.1)}</td>
+        <td>${inp('lpeak', 'dBC', 0.1)}</td>
+        <td><button class="c10-rm-inline" onclick="App.onC10RemoveMisura('${fieldId}',${gi},${mi})" title="Rimuovi">✕</button></td>
+      </tr>`;
     }).join('');
-
-    const postazioniHtml = (g.postazioni || []).map((p, pi) =>
-      _c10PostazioneHtml(fieldId, gi, pi, p)
-    ).join('');
 
     return `<div class="c10-gruppo" id="c10-g-${fieldId}-${gi}">
       <div class="c10-gruppo-hdr" onclick="App.toggleC10Gruppo('${fieldId}',${gi})">
         <span class="c10-gruppo-n">Gruppo omogeneo ${gi + 1}${g.nome ? ' — ' + escHtml(g.nome) : ''}</span>
-        <span class="c10-toggle-icon">${ic(gi === 0 ? 'chevron_up' : 'chevron_down', 13)}</span>
+        <span class="c10-classe" id="c10-badge-${fieldId}-${gi}" style="margin:0 8px;padding:2px 10px;display:none"></span>
+        <span class="c10-toggle-icon">${ic('chevron_down', 13)}</span>
         <button class="c10-rm-btn" onclick="event.stopPropagation();App.onC10RemoveGruppo('${fieldId}',${gi})" title="Rimuovi gruppo">✕</button>
       </div>
 
-      <div class="c10-gruppo-body${gi === 0 ? ' open' : ''}">
+      <div class="c10-gruppo-body">
       <div class="c10-grid2">
         <div class="c10-field-row">
           <label class="c10-lbl">Nome gruppo</label>
           <input class="c10-inp" type="text" value="${escHtml(g.nome || '')}"
-            onchange="App.onC10GruppoField('${fieldId}',${gi},'nome',this.value)"
-            placeholder="es. Operai produzione">
+            onchange="App.onC10GruppoField('${fieldId}',${gi},'nome',this.value)">
         </div>
         <div class="c10-field-row">
           <label class="c10-lbl">Ore lavoro / giorno</label>
           <input class="c10-num" type="number" step="0.5" min="1" max="12" value="${g.ore_lavoro_gg || 8}"
             onchange="App.onC10GruppoField('${fieldId}',${gi},'ore_lavoro_gg',parseFloat(this.value)||8)">
         </div>
-        <div class="c10-field-row">
-          <label class="c10-lbl">Rif. ambiente</label>
-          <input class="c10-inp-sm" type="text" value="${escHtml(g.rif_ambiente || '')}"
-            onchange="App.onC10GruppoField('${fieldId}',${gi},'rif_ambiente',this.value)">
-        </div>
-        <div class="c10-field-row">
-          <label class="c10-lbl">Rif. fase</label>
-          <input class="c10-inp-sm" type="text" value="${escHtml(g.rif_fase || '')}"
-            onchange="App.onC10GruppoField('${fieldId}',${gi},'rif_fase',this.value)">
-        </div>
       </div>
-
       <div class="c10-sn-row">
         <span class="c10-sn-lbl">Sostanze ototossiche</span>
         <button class="c10-sn-btn${g.sostanze_ototossiche ? ' c10-sn-active' : ''}"
           onclick="App.onC10GruppoField('${fieldId}',${gi},'sostanze_ototossiche',true)">Sì</button>
         <button class="c10-sn-btn${!g.sostanze_ototossiche ? ' c10-sn-active' : ''}"
           onclick="App.onC10GruppoField('${fieldId}',${gi},'sostanze_ototossiche',false)">No</button>
-      </div>
-      <div class="c10-sn-row">
-        <span class="c10-sn-lbl">Esposizione a vibrazioni</span>
+        <span class="c10-sn-lbl" style="margin-left:24px">Esposizione a vibrazioni</span>
         <button class="c10-sn-btn${g.vibrazioni ? ' c10-sn-active' : ''}"
           onclick="App.onC10GruppoField('${fieldId}',${gi},'vibrazioni',true)">Sì</button>
         <button class="c10-sn-btn${!g.vibrazioni ? ' c10-sn-active' : ''}"
           onclick="App.onC10GruppoField('${fieldId}',${gi},'vibrazioni',false)">No</button>
       </div>
-
       <div class="c10-field-row c10-full">
         <label class="c10-lbl">Descrizione attività</label>
         <textarea class="c10-textarea" rows="2"
           onchange="App.onC10GruppoField('${fieldId}',${gi},'descrizione_attivita',this.value)"
-          placeholder="Descrivere le attività lavorative svolte...">${escHtml(g.descrizione_attivita || '')}</textarea>
+          placeholder="Descrivere le attività lavorative che comportano esposizione al rumore...">${escHtml(g.descrizione_attivita || '')}</textarea>
       </div>
 
-      ${attList.length ? `<div class="c10-att-section">
-        <div class="c10-subsec-hdr">Attrezzature rumorose usate dal gruppo</div>
-        <div class="c10-subsec-desc">Spunta le attrezzature rumorose effettivamente utilizzate da questo gruppo.</div>
-        <div class="c10-att-grid">${attChecks}</div>
-      </div>` : ''}
+      <div class="c10-postazioni-section">
+        <div class="c10-subsec-hdr">Attrezzature e misurazioni</div>
+        <div class="c10-subsec-desc">Ogni riga è una attrezzatura (max 30): tempo di esposizione giornaliero e livelli misurati.</div>
+        <table class="c10-meas-table">
+          <thead><tr><th>#</th><th>Attrezzatura</th><th>Tempo (min)</th>
+            <th>L<sub>Aeq</sub> [dBA]</th><th>L<sub>Ceq</sub> [dBC]</th><th>L<sub>picco</sub> [dBC]</th><th></th></tr></thead>
+          <tbody>${righe || `<tr><td colspan="7" class="c10-empty-hint">Nessuna misurazione.</td></tr>`}</tbody>
+        </table>
+        <button class="c10-add-sm-btn" onclick="App.onC10AddMisura('${fieldId}',${gi})">${ic('plus', 12)} Aggiungi attrezzatura</button>
+      </div>
 
       <div class="c10-postazioni-section">
-        <div class="c10-subsec-hdr">Postazioni di misura</div>
-        <div class="c10-subsec-desc">Ogni postazione è un punto/condizione in cui hai misurato il rumore: inserisci i valori letti dal fonometro e i lavoratori esposti.</div>
-        ${postazioniHtml || `<div class="c10-empty-hint">Nessuna postazione. Aggiungine una per inserire i valori fonometrici.</div>`}
-        <button class="c10-add-sm-btn" onclick="App.onC10AddPostazione('${fieldId}',${gi})">${ic('plus', 12)} Aggiungi postazione di misura</button>
+        <div class="c10-subsec-hdr">Risultati del gruppo</div>
+        <div id="c10-res-${fieldId}-${gi}"><div class="c10-empty-hint">Calcolo…</div></div>
       </div>
       </div>
     </div>`;
   }
 
-  function _c10PostazioneHtml(fieldId, gi, pi, p) {
-    const misure = p.misure || [{},{},{}];
-
-    const misureRows = [0, 1, 2].map(mi => {
-      const m = misure[mi] || {};
-      return `<tr>
-        <td class="c10-td-center">Misura ${mi + 1}</td>
-        <td><input class="c10-meas" type="number" step="0.1" value="${m.LAeq !== undefined && m.LAeq !== '' ? m.LAeq : ''}"
-          onchange="App.onC10Misura('${fieldId}',${gi},${pi},${mi},'LAeq',this.value)"
-          placeholder="—"></td>
-        <td><input class="c10-meas" type="number" step="0.1" value="${m.LCeq !== undefined && m.LCeq !== '' ? m.LCeq : ''}"
-          onchange="App.onC10Misura('${fieldId}',${gi},${pi},${mi},'LCeq',this.value)"
-          placeholder="—"></td>
-        <td><input class="c10-meas" type="number" step="0.1" value="${m.Lpicco !== undefined && m.Lpicco !== '' ? m.Lpicco : ''}"
-          onchange="App.onC10Misura('${fieldId}',${gi},${pi},${mi},'Lpicco',this.value)"
-          placeholder="—"></td>
-      </tr>`;
-    }).join('');
-
-    const laeqs  = misure.map(m => m.LAeq);
-    const lceqs  = misure.map(m => m.LCeq);
-    const lpicos = misure.map(m => m.Lpicco);
-    const laeq_m  = _c10EnergyAvg(laeqs);
-    const lceq_m  = _c10EnergyAvg(lceqs);
-    const lpico_m = Math.max(...lpicos.map(v => parseFloat(v)).filter(v => !isNaN(v) && v > 0), 0) || null;
-    const fmt = v => v !== null && !isNaN(v) && v > 0 ? v.toFixed(1) : '—';
-
-    const sorgenti = p.sorgenti_rumore || [{ nome: '', m1: '', m2: '', m3: '' }];
-    const sorgentiHtml = sorgenti.map((s, si) => `
-      <div class="c10-sorgente-row">
-        <input class="c10-inp" type="text" value="${escHtml(s.nome || '')}"
-          onchange="App.onC10Sorgente('${fieldId}',${gi},${pi},${si},'nome',this.value)"
-          placeholder="Nome sorgente (es. Fresatrice)">
-        <input class="c10-inp-sm" type="text" value="${escHtml(s.m1 || '')}"
-          onchange="App.onC10Sorgente('${fieldId}',${gi},${pi},${si},'m1',this.value)"
-          placeholder="Misura 1 — condiz.">
-        <input class="c10-inp-sm" type="text" value="${escHtml(s.m2 || '')}"
-          onchange="App.onC10Sorgente('${fieldId}',${gi},${pi},${si},'m2',this.value)"
-          placeholder="Misura 2 — condiz.">
-        <input class="c10-inp-sm" type="text" value="${escHtml(s.m3 || '')}"
-          onchange="App.onC10Sorgente('${fieldId}',${gi},${pi},${si},'m3',this.value)"
-          placeholder="Misura 3 — condiz.">
-        <button class="c10-rm-inline" onclick="App.onC10RemoveSorgente('${fieldId}',${gi},${pi},${si})" title="Rimuovi">✕</button>
-      </div>`).join('');
-
-    const lavRows = (p.lavoratori_esposti || []).map((lav, li) => `
-      <tr>
-        <td>${_groupSelectHtml(lav.gruppo,
-          `App.onC10Lavoratore('${fieldId}',${gi},${pi},${li},'gruppo',this.value)`,
-          'Gruppo esposto', 'c10-inp')}</td>
-        <td><input class="c10-meas" type="number" step="1" value="${lav.Tm_j || ''}"
-          onchange="App.onC10Lavoratore('${fieldId}',${gi},${pi},${li},'Tm_j',this.value)"
-          placeholder="min"></td>
-        <td><button class="c10-rm-inline" onclick="App.onC10RemoveLav('${fieldId}',${gi},${pi},${li})">✕</button></td>
-      </tr>`).join('');
-
-    return `<div class="c10-postazione" id="c10-p-${fieldId}-${gi}-${pi}">
-      <div class="c10-post-hdr">
-        <span>Postazione ${pi + 1}</span>
-        <button class="c10-rm-btn" onclick="App.onC10RemovePostazione('${fieldId}',${gi},${pi})">✕</button>
-      </div>
-
-      <div class="c10-field-row">
-        <label class="c10-lbl">Condizione di misura</label>
-        <input class="c10-inp c10-full-w" type="text" value="${escHtml(p.condizione_misura || '')}"
-          onchange="App.onC10PostazioneField('${fieldId}',${gi},${pi},'condizione_misura',this.value)"
-          placeholder="es. Normale operatività">
-      </div>
-
-      <div class="c10-subsec-hdr c10-mt">Sorgenti di rumore</div>
-      <div class="c10-subsec-desc">Le macchine/attività che generano rumore in questa postazione.</div>
-      ${sorgentiHtml}
-      <button class="c10-add-xs-btn" onclick="App.onC10AddSorgente('${fieldId}',${gi},${pi})">${ic('plus', 11)} Aggiungi sorgente</button>
-
-      <div class="c10-subsec-hdr c10-mt">Misure acustiche</div>
-      <div class="c10-subsec-desc">Inserisci i valori letti dal fonometro (fino a 3 rilievi). L<sub>Aeq</sub> = livello medio, L<sub>picco</sub> = picco massimo. La media è calcolata da sola.</div>
-      <table class="c10-meas-table">
-        <thead><tr>
-          <th></th><th>L<sub>Aeq,mi</sub> [dBA]</th>
-          <th>L<sub>Ceq,mi</sub> [dBC]</th>
-          <th>L<sub>picco,mi</sub> [dBC]</th>
-        </tr></thead>
-        <tbody>
-          ${misureRows}
-          <tr class="c10-avg-row">
-            <td class="c10-td-center c10-avg-lbl">Media (auto)</td>
-            <td class="c10-avg-val">${fmt(laeq_m)}</td>
-            <td class="c10-avg-val">${fmt(lceq_m)}</td>
-            <td class="c10-avg-val">${fmt(lpico_m)}</td>
-          </tr>
-        </tbody>
-      </table>
-
-      <div class="c10-subsec-hdr c10-mt">Lavoratori esposti</div>
-      <div class="c10-subsec-desc">Chi lavora in questa postazione e per quanti minuti al giorno (T<sub>m,j</sub>).</div>
-      <table class="c10-lav-table">
-        <thead><tr><th>Gruppo omogeneo</th><th>Minuti/giorno (T<sub>m,j</sub>)</th><th></th></tr></thead>
-        <tbody>
-          ${lavRows || `<tr><td colspan="3" class="c10-empty-hint">Nessun lavoratore. Aggiungine uno.</td></tr>`}
-        </tbody>
-      </table>
-      <button class="c10-add-xs-btn" onclick="App.onC10AddLavoratore('${fieldId}',${gi},${pi})">${ic('plus', 11)} Aggiungi lavoratore esposto</button>
-    </div>`;
+  function _c10Calc(fieldId, gi) {
+    clearTimeout(_c10Timers[fieldId + gi]);
+    _c10Timers[fieldId + gi] = setTimeout(async () => {
+      const ed = state.formValues[fieldId]; const g = ed && ed.gruppi_omogenei[gi];
+      const box = document.getElementById(`c10-res-${fieldId}-${gi}`);
+      if (!g || !box) return;
+      const r = await call('cap10_calcola', g.misure || []);
+      const badge = document.getElementById(`c10-badge-${fieldId}-${gi}`);
+      if (!r || !r.ok || r.lex === null || r.lex === undefined) {
+        box.innerHTML = `<div class="c10-empty-hint">${r && r.error ? escHtml(r.error) : 'Inserisci almeno una misurazione per vedere i risultati.'}</div>`;
+        if (badge) badge.style.display = 'none';
+        return;
+      }
+      const liv = C10_LIVELLI.includes(g.rischio_manuale) ? g.rischio_manuale : r.rischio;
+      if (badge) { badge.style.display = ''; badge.textContent = 'Rischio ' + liv; }
+      const th = t => `<th style="background:var(--gray-50);padding:6px 8px;border:1px solid var(--gray-200);text-align:center">${t}</th>`;
+      const td = (t, b) => `<td style="padding:6px 8px;border:1px solid var(--gray-100);text-align:center;${b ? 'font-weight:700;color:var(--blue-800)' : ''}">${t}</td>`;
+      const dpiRows = (r.dpi || []).map(d => `<tr>${td(d.n)}${td(escHtml(d.attrezzatura))}${td(_c10f(d.laeq_m))}${td(d.lceq_m === null ? '' : _c10f(d.lceq_m))}${td(_c10f(d.laeq_dpi))}${td(d.stima)}</tr>`).join('');
+      const optsR = ['<option value="">Automatico (' + r.rischio + ')</option>']
+        .concat(C10_LIVELLI.map(l => `<option value="${l}"${g.rischio_manuale === l ? ' selected' : ''}>${l}</option>`)).join('');
+      box.innerHTML = `
+        ${r.troncato ? '<div class="c10-empty-hint">Attenzione: oltre 30 attrezzature, le ultime non sono calcolate.</div>' : ''}
+        ${r.insufficienti ? '<div class="c10-empty-hint">Attenzione: con il massimo SNR cercato restano righe «Insufficiente».</div>' : ''}
+        <div class="c10-subsec-desc">Riepilogo L<sub>EX,8h</sub> (foglio 3)</div>
+        <table class="c10-meas-table"><thead><tr>${th('L<sub>EX,8h</sub> [dBA]')}${th('U(L<sub>EX,8h</sub>) [dBA]')}${th("L'<sub>EX,8h</sub> [dBA]")}${th('P<sub>peak</sub> max [dBC]')}</tr></thead>
+          <tbody><tr>${td(_c10f(r.lex))}${td(_c10f(r.U))}${td(_c10f(r.lex_p), 1)}${td(_c10f(r.ppeak), 1)}</tr></tbody></table>
+        <div class="c10-subsec-desc c10-mt">Verifica DPI — metodo SNR = <b>${r.snr}</b> dB (foglio 4)</div>
+        <table class="c10-meas-table"><thead><tr>${th('#')}${th('Attrezzatura')}${th('L<sub>Aeq,m</sub>')}${th('L<sub>Ceq,m</sub>')}${th("L'<sub>Aeq,m</sub>")}${th('Stima protezione')}</tr></thead>
+          <tbody>${dpiRows}</tbody></table>
+        <div class="c10-subsec-desc c10-mt">Riepilogo con DPI (foglio 5)</div>
+        <table class="c10-meas-table"><thead><tr>${th('L<sub>EX,8h</sub> [dBA]')}${th("L'<sub>EX,8h</sub> SNR [dBA]")}${th('U(L<sub>EX,8h</sub>) [dBA]')}${th("L'<sub>EX,8hmax</sub> SNR [dBA]")}${th('P<sub>peak</sub> max [dBC]')}</tr></thead>
+          <tbody><tr>${td(_c10f(r.lex))}${td(_c10f(r.lex_snr))}${td(_c10f(r.U))}${td(_c10f(r.lex_snr_max), 1)}${td(_c10f(r.ppeak))}</tr></tbody></table>
+        <div class="c10-row c10-mt">
+          <label class="c10-lbl">Rischio residuo (§6.2)</label>
+          <select class="c10-sel" onchange="App.onC10Rischio('${fieldId}',${gi},this.value)">${optsR}</select>
+          <span class="c10-classe" style="margin:0">${liv}</span>
+        </div>`;
+    }, 250);
   }
 
   /* ── Event handlers cap10 ────────────────────────────────────────────── */
@@ -7142,127 +7051,70 @@ const App = (() => {
   function onC10Fonometro(fieldId, val) {
     const ed = state.formValues[fieldId]; if (!ed) return;
     ed.fonometro_tipo = val;
+    ed.fonometri_extra = (ed.fonometri_extra || []).filter(f => f !== val);
     _c10Rebuild(fieldId);
+  }
+
+  function onC10FonExtra(fieldId, id, checked) {
+    const ed = state.formValues[fieldId]; if (!ed) return;
+    const s = new Set(ed.fonometri_extra || []);
+    if (checked) s.add(id); else s.delete(id);
+    ed.fonometri_extra = Array.from(s);
+    saveChapterDraft();
   }
 
   function onC10GruppoField(fieldId, gi, key, value) {
     const ed = state.formValues[fieldId]; if (!ed) return;
     const g = ed.gruppi_omogenei[gi]; if (!g) return;
     g[key] = value;
-    const rebuild = (key === 'sostanze_ototossiche' || key === 'vibrazioni');
-    if (rebuild) _c10Rebuild(fieldId, gi); else saveChapterDraft();
-  }
-
-  function onC10AttSel(fieldId, gi, nome, checked) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const g = ed.gruppi_omogenei[gi]; if (!g) return;
-    if (!Array.isArray(g.attrezzature_selezionate)) g.attrezzature_selezionate = [];
-    if (checked) { if (!g.attrezzature_selezionate.includes(nome)) g.attrezzature_selezionate.push(nome); }
-    else g.attrezzature_selezionate = g.attrezzature_selezionate.filter(a => a !== nome);
-    saveChapterDraft();
+    if (key === 'sostanze_ototossiche' || key === 'vibrazioni' || key === 'nome') _c10Rebuild(fieldId, gi);
+    else saveChapterDraft();
   }
 
   function onC10AddGruppo(fieldId) {
     const ed = state.formValues[fieldId]; if (!ed) return;
-    const id = (ed.gruppi_omogenei.length || 0) + 1;
-    ed.gruppi_omogenei.push(_c10DefaultGruppo(id, '', ed.attrezzature_disponibili || []));
+    ed.gruppi_omogenei.push(_c10DefaultGruppo(ed.gruppi_omogenei.length + 1, ''));
     _c10Rebuild(fieldId, ed.gruppi_omogenei.length - 1);
   }
 
   function onC10RemoveGruppo(fieldId, gi) {
     const ed = state.formValues[fieldId]; if (!ed) return;
-    if (ed.gruppi_omogenei.length <= 1) return;
     ed.gruppi_omogenei.splice(gi, 1);
     ed.gruppi_omogenei.forEach((g, i) => { g.id = i + 1; });
     _c10Rebuild(fieldId);
   }
 
-  function onC10AddPostazione(fieldId, gi) {
+  function onC10AddMisura(fieldId, gi) {
     const ed = state.formValues[fieldId]; if (!ed) return;
     const g = ed.gruppi_omogenei[gi]; if (!g) return;
-    if (!Array.isArray(g.postazioni)) g.postazioni = [];
-    g.postazioni.push(_c10DefaultPostazione(g.postazioni.length + 1));
+    if (!Array.isArray(g.misure)) g.misure = [];
+    g.misure.push(_c10DefaultMisura());
     _c10Rebuild(fieldId, gi);
   }
 
-  function onC10RemovePostazione(fieldId, gi, pi) {
+  function onC10RemoveMisura(fieldId, gi, mi) {
     const ed = state.formValues[fieldId]; if (!ed) return;
     const g = ed.gruppi_omogenei[gi]; if (!g) return;
-    g.postazioni.splice(pi, 1);
-    g.postazioni.forEach((p, i) => { p.numero = i + 1; });
+    g.misure.splice(mi, 1);
     _c10Rebuild(fieldId, gi);
   }
 
-  function onC10PostazioneField(fieldId, gi, pi, key, value) {
+  function onC10Misura(fieldId, gi, mi, key, value) {
     const ed = state.formValues[fieldId]; if (!ed) return;
-    const p = (ed.gruppi_omogenei[gi] || {}).postazioni && ed.gruppi_omogenei[gi].postazioni[pi];
-    if (!p) return;
-    p[key] = value;
+    const m = ed.gruppi_omogenei[gi] && ed.gruppi_omogenei[gi].misure[mi];
+    if (!m) return;
+    m[key] = key === 'attrezzatura' ? value : (value === '' ? '' : parseFloat(value));
+    if (typeof m[key] === 'number' && isNaN(m[key])) m[key] = '';
     saveChapterDraft();
+    _c10Calc(fieldId, gi);
   }
 
-  function onC10Misura(fieldId, gi, pi, mi, key, value) {
+  function onC10Rischio(fieldId, gi, val) {
     const ed = state.formValues[fieldId]; if (!ed) return;
-    const p = ed.gruppi_omogenei[gi] && ed.gruppi_omogenei[gi].postazioni[pi];
-    if (!p) return;
-    if (!Array.isArray(p.misure)) p.misure = [{},{},{}];
-    if (!p.misure[mi]) p.misure[mi] = {};
-    p.misure[mi][key] = value === '' ? '' : parseFloat(value) || '';
-    _c10Rebuild(fieldId, gi);
-  }
-
-  function onC10Sorgente(fieldId, gi, pi, si, key, value) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const p = ed.gruppi_omogenei[gi] && ed.gruppi_omogenei[gi].postazioni[pi];
-    if (!p) return;
-    if (!Array.isArray(p.sorgenti_rumore)) p.sorgenti_rumore = [];
-    if (!p.sorgenti_rumore[si]) p.sorgenti_rumore[si] = {};
-    p.sorgenti_rumore[si][key] = value;
+    const g = ed.gruppi_omogenei[gi]; if (!g) return;
+    g.rischio_manuale = val || '';
     saveChapterDraft();
-  }
-
-  function onC10AddSorgente(fieldId, gi, pi) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const p = ed.gruppi_omogenei[gi] && ed.gruppi_omogenei[gi].postazioni[pi];
-    if (!p) return;
-    if (!Array.isArray(p.sorgenti_rumore)) p.sorgenti_rumore = [];
-    p.sorgenti_rumore.push({ nome: '', m1: '', m2: '', m3: '' });
-    _c10Rebuild(fieldId, gi);
-  }
-
-  function onC10RemoveSorgente(fieldId, gi, pi, si) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const p = ed.gruppi_omogenei[gi] && ed.gruppi_omogenei[gi].postazioni[pi];
-    if (!p || !p.sorgenti_rumore || p.sorgenti_rumore.length <= 1) return;
-    p.sorgenti_rumore.splice(si, 1);
-    _c10Rebuild(fieldId, gi);
-  }
-
-  function onC10Lavoratore(fieldId, gi, pi, li, key, value) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const p = ed.gruppi_omogenei[gi] && ed.gruppi_omogenei[gi].postazioni[pi];
-    if (!p) return;
-    if (!Array.isArray(p.lavoratori_esposti)) p.lavoratori_esposti = [];
-    if (!p.lavoratori_esposti[li]) p.lavoratori_esposti[li] = {};
-    p.lavoratori_esposti[li][key] = key === 'Tm_j' ? (parseFloat(value) || 0) : value;
-    saveChapterDraft();
-  }
-
-  function onC10AddLavoratore(fieldId, gi, pi) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const p = ed.gruppi_omogenei[gi] && ed.gruppi_omogenei[gi].postazioni[pi];
-    if (!p) return;
-    if (!Array.isArray(p.lavoratori_esposti)) p.lavoratori_esposti = [];
-    p.lavoratori_esposti.push({ gruppo: '', Tm_j: 480 });
-    _c10Rebuild(fieldId, gi);
-  }
-
-  function onC10RemoveLav(fieldId, gi, pi, li) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const p = ed.gruppi_omogenei[gi] && ed.gruppi_omogenei[gi].postazioni[pi];
-    if (!p || !p.lavoratori_esposti || p.lavoratori_esposti.length <= 1) return;
-    p.lavoratori_esposti.splice(li, 1);
-    _c10Rebuild(fieldId, gi);
+    _c10Calc(fieldId, gi);
   }
 
   function onC10Prescrizione(fieldId, key, checked) {
@@ -7273,13 +7125,6 @@ const App = (() => {
   }
 
   function toggleC10Gruppo(fieldId, gi) {
-    document.querySelectorAll(`#c10-editor-${fieldId} .c10-gruppo`).forEach((g, idx) => {
-      if (idx !== gi) {
-        g.querySelector('.c10-gruppo-body')?.classList.remove('open');
-        const icon = g.querySelector('.c10-toggle-icon');
-        if (icon) icon.innerHTML = ic('chevron_down', 13);
-      }
-    });
     const body = document.querySelector(`#c10-g-${fieldId}-${gi} .c10-gruppo-body`);
     if (!body) return;
     const isOpen = body.classList.toggle('open');
@@ -10446,11 +10291,9 @@ const App = (() => {
     onC6VarToggle, onCap6Sel, onCap6Field,
     openCap6Misure, saveCap6Misure, closeCap6Misure, onCap6MisMain, onCap6MisSub,
     // Cap10 editor
-    onC10Fonometro, onC10GruppoField, onC10AttSel,
+    onC10Fonometro, onC10FonExtra, onC10GruppoField,
     onC10AddGruppo, onC10RemoveGruppo,
-    onC10AddPostazione, onC10RemovePostazione, onC10PostazioneField,
-    onC10Misura, onC10Sorgente, onC10AddSorgente, onC10RemoveSorgente,
-    onC10Lavoratore, onC10AddLavoratore, onC10RemoveLav,
+    onC10AddMisura, onC10RemoveMisura, onC10Misura, onC10Rischio,
     onC10Prescrizione,
     toggleC10Gruppo,
     // Cap14 editor
